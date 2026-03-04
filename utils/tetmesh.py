@@ -52,7 +52,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales):
     device = vertices.device
     
     # call by chunk
-    chunk_size = 32 * 1024 * 1024
+    chunk_size = 16 * 1024 * 1024
     if tets.shape[0] > chunk_size:
         merged_verts = None
         merged_scales = None
@@ -60,6 +60,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales):
         merged_verts_ids = None
         for tet_chunk in torch.chunk(tets, tets.shape[0] // chunk_size + 1):
             torch.cuda.empty_cache()
+            tet_chunk = tet_chunk.long()  # convert only this chunk to int64 for indexing
             verts, verts_scales, faces, verts_ids = _unbatched_marching_tetrahedra(vertices, tet_chunk, sdf, scales)
             
             if merged_verts is None:

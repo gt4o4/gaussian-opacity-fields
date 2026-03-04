@@ -34,13 +34,16 @@ def evaluage_alpha(points, views, gaussians, pipeline, background, kernel_size, 
     return alpha
 
 @torch.no_grad()
-def marching_tetrahedra_with_binary_search(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, filter_mesh : bool, texture_mesh : bool, near : float, far : float):
+def marching_tetrahedra_with_binary_search(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, filter_mesh : bool, texture_mesh : bool, near : float, far : float, bounding_mode : str = 'stp', opacity_cutoff_tetra : float = 0.0, bbox=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "fusion")
 
     makedirs(render_path, exist_ok=True)
-    
+
     # generate tetra points here
-    points, points_scale = gaussians.get_tetra_points(views, near, far)
+    points, points_scale = gaussians.get_tetra_points(views, near, far,
+                                                       bounding_mode=bounding_mode,
+                                                       opacity_cutoff=opacity_cutoff_tetra,
+                                                       bbox=bbox)
     # load cell if exists
     if os.path.exists(os.path.join(render_path, "cells.pt")):
         print("load existing cells")
@@ -56,7 +59,8 @@ def marching_tetrahedra_with_binary_search(model_path, name, iteration, views, g
     alpha = evaluage_alpha(points, views, gaussians, pipeline, background, kernel_size)
 
     vertices = points.cuda()[None]
-    tets = cells.cuda().long()
+    tets = cells.cuda()  # keep as int32 to save ~12 GB GPU memory; convert per-chunk in marching_tetrahedra
+    del cells  # free CPU copy
 
     print(vertices.shape, tets.shape, alpha.shape)
     def alpha_to_sdf(alpha):    
@@ -126,19 +130,19 @@ def marching_tetrahedra_with_binary_search(model_path, name, iteration, views, g
     # mesh.export(os.path.join(render_path, f"mesh_binary_search_interp.ply"))
     
 
-def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelineParams, filter_mesh : bool, texture_mesh : bool, near : float, far : float):
+def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelineParams, filter_mesh : bool, texture_mesh : bool, near : float, far : float, bounding_mode : str = 'stp', opacity_cutoff_tetra : float = 0.0, bbox=None, name : str = 'test'):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        
+
         gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"))
-        
+
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         kernel_size = dataset.kernel_size
-        
+
         cams = scene.getTrainCameras()
-        marching_tetrahedra_with_binary_search(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, filter_mesh, texture_mesh, near, far)
+        marching_tetrahedra_with_binary_search(dataset.model_path, name, iteration, cams, gaussians, pipeline, background, kernel_size, filter_mesh, texture_mesh, near, far, bounding_mode, opacity_cutoff_tetra, bbox)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -151,13 +155,22 @@ if __name__ == "__main__":
     parser.add_argument("--texture_mesh", action="store_true")
     parser.add_argument("--near", default=0.02, type=float)
     parser.add_argument("--far", default=1e6, type=float)
-    
+    parser.add_argument("--bounding_mode", default="stp", choices=["sigma_3", "sigma_333", "stp"],
+                        help="Gaussian bounding mode for tetra grid (default: stp)")
+    parser.add_argument("--opacity_cutoff_tetra", default=0.0039, type=float,
+                        help="Remove Gaussians with opacity below this before tetra generation (default: 0.0039)")
+    parser.add_argument("--bbox", default=None, type=float, nargs=6,
+                        metavar=('XMIN', 'YMIN', 'ZMIN', 'XMAX', 'YMAX', 'ZMAX'),
+                        help="Bounding box in reconstruction coords to crop Gaussians before tetra generation")
+    parser.add_argument("--name", default="test", type=str,
+                        help="Output subdirectory name (default: test)")
+
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
-    
+
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
-    
-    extract_mesh(model.extract(args), args.iteration, pipeline.extract(args), args.filter_mesh, args.texture_mesh, args.near, args.far)
+
+    extract_mesh(model.extract(args), args.iteration, pipeline.extract(args), args.filter_mesh, args.texture_mesh, args.near, args.far, args.bounding_mode, args.opacity_cutoff_tetra, args.bbox, args.name)

@@ -28,47 +28,53 @@ from einops import einsum
 from typing import List
 
 @torch.no_grad()
-def get_frustum_mask(points: torch.Tensor, cameras: List[Camera], near: float = 0.02, far: float = 1e6):
+def get_frustum_mask(points: torch.Tensor, cameras: List[Camera], near: float = 0.02, far: float = 1e6, batch_size: int = 2):
     H, W = cameras[0].image_height, cameras[0].image_width
-
-    intrinsics = torch.stack(
-        [
-            torch.Tensor(
-                [[cam.focal_x, 0, W / 2],
-                 [0, cam.focal_y, H / 2],
-                 [0, 0, 1]]
-            ) for cam in cameras
-        ], 
-        dim=0
-    ).to(points.device)
-
-    # full_proj_matrices: (n_view, 4, 4)
-    view_matrices = torch.stack(
-        [cam.world_view_transform for cam in cameras], dim=0
-    ).transpose(1, 2)
+    N = points.shape[0]
 
     ones = torch.ones_like(points[:, 0]).unsqueeze(-1)
     # homo_points: (N, 4)
     homo_points = torch.cat([points, ones], dim=-1)
 
-    # uv_points: (n_view, N, 4, 4)
-    # Apply batch matrix multiplication to get uv_points for all cameras
-    view_points = einsum(view_matrices, homo_points, "n_view b c, N c -> n_view N b")
-    view_points = view_points[:, :, :3]
+    # Process cameras in batches to avoid OOM
+    mask = torch.zeros(N, dtype=torch.bool, device=points.device)
 
-    uv_points = einsum(intrinsics, view_points, "n_view b c, n_view N c -> n_view N b")
+    for batch_start in range(0, len(cameras), batch_size):
+        batch_cams = cameras[batch_start:batch_start + batch_size]
 
-    z = uv_points[:, :, -1:]
-    uv_points = uv_points[:, :, :2] / z
-    u, v = uv_points[:, :, 0], uv_points[:, :, 1]
+        intrinsics = torch.stack(
+            [
+                torch.Tensor(
+                    [[cam.focal_x, 0, W / 2],
+                     [0, cam.focal_y, H / 2],
+                     [0, 0, 1]]
+                ) for cam in batch_cams
+            ],
+            dim=0
+        ).to(points.device)
 
-    # Optionally, we can apply near-far culling
-    # Apply near-far culling
-    depth = view_points[:, :, -1]
-    cull_near_fars = (depth >= near) & (depth <= far)
+        view_matrices = torch.stack(
+            [cam.world_view_transform for cam in batch_cams], dim=0
+        ).transpose(1, 2)
 
-    # Apply frustum mask
-    mask = torch.any(cull_near_fars & (u >= 0) & (u <= W-1) & (v >= 0) & (v <= H-1), dim=0)
+        view_points = einsum(view_matrices, homo_points, "n_view b c, N c -> n_view N b")
+        view_points = view_points[:, :, :3]
+
+        uv_points = einsum(intrinsics, view_points, "n_view b c, n_view N c -> n_view N b")
+
+        z = uv_points[:, :, -1:]
+        uv_points = uv_points[:, :, :2] / z
+        u, v = uv_points[:, :, 0], uv_points[:, :, 1]
+
+        depth = view_points[:, :, -1]
+        cull_near_fars = (depth >= near) & (depth <= far)
+
+        batch_mask = torch.any(cull_near_fars & (u >= 0) & (u <= W-1) & (v >= 0) & (v <= H-1), dim=0)
+        mask = mask | batch_mask
+
+        del view_points, uv_points, intrinsics, view_matrices
+        torch.cuda.empty_cache()
+
     return mask
 
 
@@ -430,21 +436,46 @@ class GaussianModel:
         PlyData([el]).write(path)
 
     @torch.no_grad()
-    def get_tetra_points(self, views: List[Camera], near: float = 0.02, far: float = 1e6):
+    def get_tetra_points(self, views: List[Camera], near: float = 0.02, far: float = 1e6,
+                         bounding_mode: str = 'stp', opacity_cutoff: float = 0.0,
+                         near_far_culling: bool = False, bbox=None):
         M = trimesh.creation.box()
         M.vertices *= 2
-        
+
         rots = build_rotation(self._rotation)
         xyz = self.get_xyz
-        scale = self.get_scaling_with_3D_filter * 3. # TODO test
-        # filter points with small opacity for bicycle scene
-        # opacity = self.get_opacity_with_3D_filter
-        # mask = (opacity > 0.1).squeeze(-1)
-        # xyz = xyz[mask]
-        # scale = scale[mask]
-        # rots = rots[mask]
-        
-        vertices = M.vertices.T    
+
+        # tight opacity bounding, as in StopThePop (ported from SOF)
+        if bounding_mode == 'sigma_3':
+            scale = self.get_scaling_with_3D_filter * 3.
+        elif bounding_mode == 'sigma_333':
+            scale = self.get_scaling_with_3D_filter * 3.33
+        elif bounding_mode == 'stp':
+            scale = self.get_scaling_with_3D_filter * torch.sqrt(2. * torch.log(255. * self.get_opacity_with_3D_filter))
+        else:
+            raise ValueError(f"Unknown bounding_mode: {bounding_mode}")
+
+        # filter points with small opacity (ported from SOF)
+        if opacity_cutoff > 0.:
+            opacity = self.get_opacity_with_3D_filter
+            mask = (opacity > opacity_cutoff).squeeze(-1)
+            xyz = xyz[mask]
+            scale = scale[mask]
+            rots = rots[mask]
+
+        # clip Gaussians to bounding box (in reconstruction coordinates)
+        if bbox is not None:
+            bbox_min = torch.tensor(bbox[:3], device=xyz.device, dtype=xyz.dtype)
+            bbox_max = torch.tensor(bbox[3:], device=xyz.device, dtype=xyz.dtype)
+            # pad by max scale so Gaussians near the boundary still contribute
+            pad = scale.max(dim=-1)[0].unsqueeze(-1)
+            mask = ((xyz + pad) >= bbox_min).all(dim=-1) & ((xyz - pad) <= bbox_max).all(dim=-1)
+            print(f"bbox crop: {mask.sum().item():,} / {xyz.shape[0]:,} Gaussians kept")
+            xyz = xyz[mask]
+            scale = scale[mask]
+            rots = rots[mask]
+
+        vertices = M.vertices.T
         vertices = torch.from_numpy(vertices).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
         # scale vertices first
         vertices = vertices * scale.unsqueeze(-1)
@@ -452,15 +483,18 @@ class GaussianModel:
         vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
         # concat center points
         vertices = torch.cat([vertices, xyz], dim=0)
-        
+
         # scale is not a good solution but use it for now
         scale = scale.max(dim=-1, keepdim=True)[0]
         scale_corner = scale.repeat(1, 8).reshape(-1, 1)
         vertices_scale = torch.cat([scale_corner, scale], dim=0)
-        
+
         # Mask out vertices outside of context views
-        vertex_mask = get_frustum_mask(vertices, views, near, far)
-        return vertices[vertex_mask], vertices_scale[vertex_mask]
+        if near_far_culling:
+            vertex_mask = get_frustum_mask(vertices, views, near, far)
+            return vertices[vertex_mask], vertices_scale[vertex_mask]
+        else:
+            return vertices, vertices_scale
     
     def reset_opacity(self):
         # reset opacity to by considering 3D filter
